@@ -97,9 +97,10 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  lyseis -u https://target.com\n"
-            "  lyseis -u https://target.com --json\n"
-            "  lyseis -u https://target.com --output report.json --silent\n"
-            "  lyseis -u https://target.com --allow-external -v\n"
+            "  lyseis -u https://target.com --stealth\n"
+            "  lyseis -u https://target.com --stealth --proxy socks5://127.0.0.1:9050\n"
+            "  lyseis -u https://target.com --json --output report.json\n"
+            "  lyseis -u https://target.com --allow-external --silent --json\n"
         ),
     )
 
@@ -147,6 +148,21 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="UA",
         default=None,
         help="Override the default User-Agent string",
+    )
+    parser.add_argument(
+        "--stealth",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable stealth mode: use cloudscraper to bypass Cloudflare JS challenges "
+            "and send full browser-like headers. Auto-activates on bot-block detection."
+        ),
+    )
+    parser.add_argument(
+        "--proxy",
+        metavar="URL",
+        default=None,
+        help="Route all requests through a proxy (e.g. socks5://127.0.0.1:9050 or http://127.0.0.1:8080)",
     )
     parser.add_argument(
         "--no-color",
@@ -216,7 +232,13 @@ def main() -> None:
         output_path=args.output,
         delay=args.delay,
         timeout=args.timeout,
-        user_agent=args.user_agent or "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Lyseis/0.1",
+        user_agent=args.user_agent or (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        stealth_mode=args.stealth,
+        proxy=args.proxy,
         no_color=args.no_color,
         silent=args.silent,
         verbose=args.verbose,
@@ -227,7 +249,11 @@ def main() -> None:
     # ---------------------------------------------------------- #
     # Phase 1 — Crawl
     # ---------------------------------------------------------- #
-    _status(err_console, f"[bold cyan]  [*] Target :[/]  {url}", args.silent)
+    _status(err_console, f"[bold cyan]  [*] Target  :[/]  {url}", args.silent)
+    if config.stealth_mode:
+        _status(err_console, "[bold cyan]  [*] Mode    :[/]  [yellow]STEALTH[/yellow] (bot-bypass active)", args.silent)
+    if config.proxy:
+        _status(err_console, f"[bold cyan]  [*] Proxy   :[/]  {config.proxy}", args.silent)
     _status(err_console, "[bold cyan]  [*] Crawling for JavaScript sources...[/]", args.silent)
 
     js_sources = crawl(config)
