@@ -95,12 +95,18 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Lyseis — JavaScript Reconnaissance Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Examples:\n"
+            "Bot bypass tiers (escalate as needed):\n"
+            "  Tier 1 (default)       — browser headers + auto-cloudscraper on block\n"
+            "  Tier 2 --stealth       — force cloudscraper (Cloudflare JS challenge)\n"
+            "  Tier 3 --browser       — Playwright Chromium (Cloudflare Turnstile)\n"
+            "  Tier 3 --flaresolverr  — FlareSolverr service (strongest bypass)\n"
+            "\nExamples:\n"
             "  lyseis -u https://target.com\n"
             "  lyseis -u https://target.com --stealth\n"
+            "  lyseis -u https://target.com --browser\n"
+            "  lyseis -u https://target.com --flaresolverr http://localhost:8191\n"
             "  lyseis -u https://target.com --stealth --proxy socks5://127.0.0.1:9050\n"
             "  lyseis -u https://target.com --json --output report.json\n"
-            "  lyseis -u https://target.com --allow-external --silent --json\n"
         ),
     )
 
@@ -163,6 +169,26 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="URL",
         default=None,
         help="Route all requests through a proxy (e.g. socks5://127.0.0.1:9050 or http://127.0.0.1:8080)",
+    )
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        default=False,
+        help=(
+            "Use Playwright headless Chromium to bypass Cloudflare Turnstile and "
+            "JS-rendered challenges. Requires: pip install playwright playwright-stealth "
+            "&& playwright install chromium"
+        ),
+    )
+    parser.add_argument(
+        "--flaresolverr",
+        metavar="URL",
+        default=None,
+        dest="flaresolverr_url",
+        help=(
+            "Delegate page fetch to a FlareSolverr instance (strongest bypass). "
+            "Example: --flaresolverr http://localhost:8191"
+        ),
     )
     parser.add_argument(
         "--no-color",
@@ -238,6 +264,8 @@ def main() -> None:
             "Chrome/122.0.0.0 Safari/537.36"
         ),
         stealth_mode=args.stealth,
+        browser_mode=args.browser,
+        flaresolverr_url=args.flaresolverr_url,
         proxy=args.proxy,
         no_color=args.no_color,
         silent=args.silent,
@@ -250,8 +278,12 @@ def main() -> None:
     # Phase 1 — Crawl
     # ---------------------------------------------------------- #
     _status(err_console, f"[bold cyan]  [*] Target  :[/]  {url}", args.silent)
-    if config.stealth_mode:
-        _status(err_console, "[bold cyan]  [*] Mode    :[/]  [yellow]STEALTH[/yellow] (bot-bypass active)", args.silent)
+    if config.flaresolverr_url:
+        _status(err_console, f"[bold cyan]  [*] Mode    :[/]  [red]FLARESOLVERR[/red] → {config.flaresolverr_url}", args.silent)
+    elif config.browser_mode:
+        _status(err_console, "[bold cyan]  [*] Mode    :[/]  [magenta]BROWSER[/magenta] (Playwright headless Chromium)", args.silent)
+    elif config.stealth_mode:
+        _status(err_console, "[bold cyan]  [*] Mode    :[/]  [yellow]STEALTH[/yellow] (cloudscraper)", args.silent)
     if config.proxy:
         _status(err_console, f"[bold cyan]  [*] Proxy   :[/]  {config.proxy}", args.silent)
     _status(err_console, "[bold cyan]  [*] Crawling for JavaScript sources...[/]", args.silent)

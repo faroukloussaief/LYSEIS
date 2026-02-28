@@ -5,12 +5,11 @@ Fetches the target HTML page, extracts all <script> references
 (both external src= URLs and inline blocks), normalizes them,
 enforces same-origin scope, then downloads each external JS file.
 
-v0.1-r3: Bot protection bypass
-  - Full browser-like headers on every request (Accept, Sec-Fetch-*, etc.)
-  - --stealth flag activates cloudscraper for Cloudflare JS-challenge bypass
-  - Automatic bot-block detection (403/429/503 with WAF signatures)
-  - Auto-retry with cloudscraper if initial request is blocked
-  - Optional proxy support (--proxy)
+v0.1-r4: Three-tier bypass stack
+  Tier 1 (default)    → requests + full browser headers (basic WAFs)
+  Tier 2 (--stealth)  → cloudscraper (Cloudflare JS challenge, auto-activates on block)
+  Tier 3 (--browser)  → Playwright headless Chromium (Turnstile, JS-rendered SPAs)
+  Tier 3 (--flaresolverr) → FlareSolverr service (Turnstile + strong WAFs)
 """
 
 from __future__ import annotations
@@ -22,15 +21,14 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
+from .browser import fetch_with_playwright, fetch_with_flaresolverr, is_challenge_page
 from .config import Config
 from .models import JSSource, SourceType
 from .utils import get_logger, rate_limit
 
 
 # ------------------------------------------------------------------ #
-# Realistic browser headers — mimic a Chrome 122 on Windows request
-# Using a real browser header set is the single most effective bypass
-# for basic bot detection (DataDome, Imperva, Akamai at low tiers).
+# Realistic Chrome 122 header sets
 # ------------------------------------------------------------------ #
 
 _BROWSER_HEADERS: dict[str, str] = {
@@ -64,34 +62,15 @@ _JS_HEADERS: dict[str, str] = {
     "Sec-Fetch-Site": "same-origin",
 }
 
-# Signatures found in bot-protection challenge pages
 _BOT_BLOCK_SIGNATURES: list[str] = [
-    "cloudflare",
-    "checking your browser",
-    "just a moment",
-    "enable javascript and cookies",
-    "cf_clearance",
-    "cf-browser-verification",
-    "_iuam",
-    # Imperva / Incapsula
-    "incap_ses",
-    "visid_incap",
-    "_incapsula_",
-    # DataDome
-    "datadome",
-    "dd_referrer",
-    # PerimeterX / HUMAN
-    "px_uuid",
-    "x-px-",
-    "perimeterx",
-    "_pxhd",
-    # Akamai
-    "akamai-bot",
-    "ak_bmsc",
-    # Generic
-    "bot protection",
-    "access denied",
-    "security check",
+    "cloudflare", "checking your browser", "just a moment",
+    "enable javascript and cookies", "cf_clearance", "cf-browser-verification",
+    "_iuam", "turnstile",
+    "incap_ses", "visid_incap", "_incapsula_",
+    "datadome", "dd_referrer",
+    "px_uuid", "x-px-", "perimeterx", "_pxhd",
+    "akamai-bot", "ak_bmsc",
+    "bot protection", "access denied", "security check",
     "verify you are human",
 ]
 
@@ -99,69 +78,49 @@ _BLOCKED_STATUS_CODES: frozenset[int] = frozenset({403, 429, 503, 521, 522, 523,
 
 
 def _is_bot_blocked(resp: requests.Response) -> bool:
-    """Return True if the response looks like a bot-protection challenge."""
     if resp.status_code not in _BLOCKED_STATUS_CODES:
         return False
-    body_lower = resp.text.lower()
-    headers_lower = str(resp.headers).lower()
-    combined = body_lower + " " + headers_lower
+    combined = resp.text.lower() + " " + str(resp.headers).lower()
     return any(sig in combined for sig in _BOT_BLOCK_SIGNATURES)
 
 
 def _build_stealth_session(config: Config):
-    """
-    Build a cloudscraper session for Cloudflare JS-challenge bypass.
-    Falls back to a standard session if cloudscraper is not installed.
-    """
     try:
         import cloudscraper  # type: ignore
-
         session = cloudscraper.create_scraper(
-            browser={
-                "browser": "chrome",
-                "platform": "windows",
-                "desktop": True,
-                "mobile": False,
-            },
-            delay=10,           # seconds to wait for JS challenge resolution
+            browser={"browser": "chrome", "platform": "windows", "desktop": True},
+            delay=10,
         )
     except ImportError:
-        # Graceful degradation: inform user but keep running
         print(
-            "[!] --stealth mode requested but 'cloudscraper' is not installed.\n"
-            "    Install with: pip install cloudscraper\n"
-            "    Falling back to standard requests session.",
+            "[!] --stealth requires 'cloudscraper'. Install: pip install cloudscraper\n"
+            "    Falling back to standard requests.",
             file=sys.stderr,
         )
         session = requests.Session()
 
     session.headers.update({"User-Agent": config.user_agent})
-
     if config.proxy:
-        proxies = {"http": config.proxy, "https": config.proxy}
-        session.proxies.update(proxies)
-
+        session.proxies.update({"http": config.proxy, "https": config.proxy})
     return session
 
 
 def _build_session(config: Config) -> requests.Session:
-    """Build a standard requests.Session with full browser headers."""
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": config.user_agent,
-        **_BROWSER_HEADERS,
-    })
+    session.headers.update({"User-Agent": config.user_agent, **_BROWSER_HEADERS})
     if config.proxy:
-        proxies = {"http": config.proxy, "https": config.proxy}
-        session.proxies.update(proxies)
+        session.proxies.update({"http": config.proxy, "https": config.proxy})
     return session
 
 
 def _same_origin(base: str, target: str) -> bool:
-    """Check whether `target` shares scheme+host with `base`."""
-    b = urlparse(base)
-    t = urlparse(target)
+    b, t = urlparse(base), urlparse(target)
     return b.scheme == t.scheme and b.netloc == t.netloc
+
+
+def _normalise_url(raw: str, base: str) -> str | None:
+    abs_url = urljoin(base, raw.strip())
+    return abs_url if abs_url.startswith(("http://", "https://")) else None
 
 
 def _fetch_with_retry(
@@ -172,44 +131,29 @@ def _fetch_with_retry(
     extra_headers: dict | None = None,
 ) -> str | None:
     """
-    GET `url` with automatic bot-block detection and retry.
-
-    Strategy:
-      1. Try with current session (standard or stealth).
-      2. If bot-blocked and NOT already in stealth mode, auto-retry
-         with a cloudscraper session (transparent escalation).
-      3. Respect max_retries on transient errors (5xx).
+    GET url with bot-block detection, auto-escalation to cloudscraper,
+    and DNS-aware fast-fail logic.
     """
     headers = extra_headers or {}
 
-    for attempt in range(1, config.max_retries + 2):  # +2: 1 base + max_retries
+    for attempt in range(1, config.max_retries + 2):
         try:
-            resp = session.get(
-                url,
-                headers=headers,
-                timeout=config.timeout,
-                allow_redirects=True,
-            )
+            resp = session.get(url, headers=headers, timeout=config.timeout, allow_redirects=True)
 
-            # Bot protection check
             if _is_bot_blocked(resp):
-                logger.warning(
-                    f"Bot protection detected on {url} "
-                    f"(HTTP {resp.status_code}) "
-                    f"— {'retry' if attempt <= config.max_retries else 'giving up'}"
-                )
                 if not config.stealth_mode and attempt == 1:
-                    # Auto-escalate to cloudscraper on first block
-                    logger.debug("Auto-escalating to stealth session for retry.")
-                    stealth_cfg = config.__class__(
-                        **{**config.__dict__, "stealth_mode": True}
-                    )
-                    stealth_session = _build_stealth_session(stealth_cfg)
+                    logger.debug("Bot-block detected — auto-escalating to cloudscraper stealth.")
+                    import dataclasses
+                    stealth_cfg = dataclasses.replace(config, stealth_mode=True)
                     return _fetch_with_retry(
-                        stealth_session, url, stealth_cfg, logger, extra_headers
+                        _build_stealth_session(stealth_cfg), url, stealth_cfg, logger, extra_headers
                     )
+                logger.warning(
+                    f"Bot protection on {url} (HTTP {resp.status_code}) — "
+                    f"{'retry' if attempt <= config.max_retries else 'giving up'}"
+                )
                 if attempt <= config.max_retries:
-                    time.sleep(2 ** attempt)  # exponential back-off
+                    time.sleep(2 ** attempt)
                     continue
                 return None
 
@@ -217,17 +161,27 @@ def _fetch_with_retry(
             return resp.text
 
         except requests.exceptions.Timeout:
-            logger.warning(f"Timeout fetching: {url} (attempt {attempt})")
+            logger.warning(f"Timeout: {url} (attempt {attempt}/{config.max_retries + 1})")
         except requests.exceptions.TooManyRedirects:
             logger.warning(f"Too many redirects: {url}")
             return None
         except requests.exceptions.ConnectionError as exc:
-            logger.warning(f"Connection error for {url}: {exc}")
+            exc_str = str(exc).lower()
+            if any(k in exc_str for k in ("nameresolutionerror", "failed to resolve", "name or service not known")):
+                host = urlparse(url).netloc
+                logger.error(
+                    f"DNS resolution failed for '{host}'.\n"
+                    f"  • Check for typos in the URL\n"
+                    f"  • Verify your internet/DNS connection\n"
+                    f"  • The domain may not exist"
+                )
+                return None
+            logger.warning(f"Connection error: {url} — {exc} (attempt {attempt}/{config.max_retries + 1})")
         except requests.exceptions.HTTPError as exc:
-            logger.warning(f"HTTP {exc.response.status_code} for {url}")
+            logger.warning(f"HTTP {exc.response.status_code}: {url}")
             return None
         except requests.exceptions.RequestException as exc:
-            logger.warning(f"Request failed for {url}: {exc}")
+            logger.warning(f"Request failed: {url} — {exc}")
 
         if attempt <= config.max_retries:
             time.sleep(1.5 * attempt)
@@ -236,53 +190,76 @@ def _fetch_with_retry(
 
 
 # ------------------------------------------------------------------ #
-# Duplicate-safe URL normaliser
+# Main crawl entry point
 # ------------------------------------------------------------------ #
-
-def _normalise_url(raw: str, base: str) -> str | None:
-    """Resolve relative paths, reject non-HTTP schemes."""
-    abs_url = urljoin(base, raw.strip())
-    if abs_url.startswith(("http://", "https://")):
-        return abs_url
-    return None
-
 
 def crawl(config: Config) -> list[JSSource]:
     """
-    Main crawl entry point.
+    Three-tier crawl pipeline.
 
-    1. Build session (stealth or standard).
-    2. Fetch landing page HTML.
-    3. Extract <script src="..."> external references.
-    4. Extract inline <script>...</script> blocks.
-    5. Resolve + scope-filter external URLs.
-    6. Fetch each external JS file.
-    7. Return a deduplicated List[JSSource].
+    1. Fetch the landing page HTML (using the appropriate backend).
+    2. Extract <script src="..."> external references.
+    3. Extract inline <script>...</script> blocks.
+    4. Fetch each external JS file.
+    5. Return deduplicated List[JSSource].
     """
     logger = get_logger(__name__, verbose=config.verbose)
-
-    session = (
-        _build_stealth_session(config) if config.stealth_mode
-        else _build_session(config)
-    )
-
     sources: list[JSSource] = []
+    clearance_cookies: dict[str, str] = {}
 
     # ---------------------------------------------------------------- #
-    # Step 1 — fetch landing page
+    # Step 1 — fetch landing page using the highest available tier
     # ---------------------------------------------------------------- #
     logger.debug(f"Fetching landing page: {config.url}")
-    html = _fetch_with_retry(session, config.url, config, logger, _BROWSER_HEADERS)
+    html: str | None = None
+
+    if config.flaresolverr_url:
+        # Tier 3a: FlareSolverr
+        html, clearance_cookies = fetch_with_flaresolverr(config.url, config, logger)
+
+    elif config.browser_mode:
+        # Tier 3b: Playwright headless browser
+        html = fetch_with_playwright(config.url, config, logger)
+
+    else:
+        # Tier 1/2: requests (+ optional cloudscraper)
+        session = _build_stealth_session(config) if config.stealth_mode else _build_session(config)
+        html = _fetch_with_retry(session, config.url, config, logger, _BROWSER_HEADERS)
 
     if not html:
-        logger.error(f"Failed to fetch target URL: {config.url}")
+        logger.error(f"Failed to fetch: {config.url}")
         return sources
 
-    soup = BeautifulSoup(html, "lxml")
+    # Double-check we didn't land on a challenge page even in browser mode
+    if is_challenge_page(html) and not config.browser_mode and not config.flaresolverr_url:
+        logger.warning(
+            "Response appears to be a bot challenge page.\n"
+            "  Try one of:\n"
+            "    --stealth              (Cloudflare JS challenge)\n"
+            "    --browser              (Cloudflare Turnstile — needs Playwright)\n"
+            "    --flaresolverr URL     (strongest — needs FlareSolverr running)"
+        )
 
     # ---------------------------------------------------------------- #
-    # Step 2 — collect external JS URLs
+    # Step 2 — build the requests session for JS file downloads
+    # (inject FlareSolverr clearance cookies if we have them)
     # ---------------------------------------------------------------- #
+    if config.browser_mode:
+        # Use standard session for JS files; browser already solved challenge
+        dl_session = _build_session(config)
+    elif config.stealth_mode:
+        dl_session = _build_stealth_session(config)
+    else:
+        dl_session = _build_session(config)
+
+    if clearance_cookies:
+        dl_session.cookies.update(clearance_cookies)
+        logger.debug(f"Injected {len(clearance_cookies)} clearance cookie(s) into download session.")
+
+    # ---------------------------------------------------------------- #
+    # Step 3 — parse HTML, collect external JS URLs
+    # ---------------------------------------------------------------- #
+    soup = BeautifulSoup(html, "lxml")
     seen_urls: set[str] = set()
     external_urls: list[str] = []
 
@@ -290,16 +267,12 @@ def crawl(config: Config) -> list[JSSource]:
         raw_src: str = tag.get("src", "").strip()
         if not raw_src:
             continue
-
         abs_url = _normalise_url(raw_src, config.url)
         if abs_url is None:
-            logger.debug(f"Skipping non-HTTP src: {raw_src}")
             continue
-
         if not config.allow_external and not _same_origin(config.url, abs_url):
             logger.debug(f"Skipping cross-origin JS: {abs_url}")
             continue
-
         if abs_url not in seen_urls:
             seen_urls.add(abs_url)
             external_urls.append(abs_url)
@@ -307,41 +280,37 @@ def crawl(config: Config) -> list[JSSource]:
     logger.debug(f"Found {len(external_urls)} external JS URL(s)")
 
     # ---------------------------------------------------------------- #
-    # Step 3 — extract inline script blocks
+    # Step 4 — extract inline blocks
     # ---------------------------------------------------------------- #
     inline_count = 0
     for i, tag in enumerate(soup.find_all("script", src=False)):
         content = (tag.string or "").strip()
         if not content:
             continue
-        sources.append(
-            JSSource(
-                url=f"inline:{config.url}#{i}",
-                content=content,
-                source_type=SourceType.INLINE,
-            )
-        )
+        sources.append(JSSource(
+            url=f"inline:{config.url}#{i}",
+            content=content,
+            source_type=SourceType.INLINE,
+        ))
         inline_count += 1
 
     logger.debug(f"Found {inline_count} inline script block(s)")
 
     # ---------------------------------------------------------------- #
-    # Step 4 — fetch external JS files
+    # Step 5 — download external JS files
     # ---------------------------------------------------------------- #
     for url in external_urls:
         rate_limit(config.delay)
         logger.debug(f"Fetching JS: {url}")
-        content = _fetch_with_retry(session, url, config, logger, _JS_HEADERS)
+        content = _fetch_with_retry(dl_session, url, config, logger, _JS_HEADERS)
         if not content or not content.strip():
             logger.debug(f"Empty or blocked response: {url}")
             continue
-        sources.append(
-            JSSource(
-                url=url,
-                content=content.strip(),
-                source_type=SourceType.EXTERNAL,
-            )
-        )
+        sources.append(JSSource(
+            url=url,
+            content=content.strip(),
+            source_type=SourceType.EXTERNAL,
+        ))
 
     logger.debug(f"Crawl complete. Total JS sources: {len(sources)}")
     return sources

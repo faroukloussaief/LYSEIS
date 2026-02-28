@@ -25,10 +25,18 @@ class Config:
         "Chrome/122.0.0.0 Safari/537.36"
     )
 
-    # Bot protection bypass
-    stealth_mode: bool = False          # use cloudscraper (Cloudflare JS-challenge bypass)
-    proxy: str | None = None            # HTTP/SOCKS proxy e.g. "socks5://127.0.0.1:9050"
-    max_retries: int = 2                # retry count on bot-block 403/503
+    # Bot protection — Layer 1: cloudscraper (Cloudflare JS challenge)
+    stealth_mode: bool = False
+
+    # Bot protection — Layer 2: Playwright headless browser (Turnstile)
+    browser_mode: bool = False
+
+    # Bot protection — Layer 3: FlareSolverr external service
+    flaresolverr_url: str | None = None  # e.g. "http://localhost:8191"
+
+    # Network
+    proxy: str | None = None            # e.g. "socks5://127.0.0.1:9050"
+    max_retries: int = 2
 
     # Output
     json_output: bool = False
